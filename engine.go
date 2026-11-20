@@ -1,4 +1,4 @@
-// Package endure provides durable execution of ordinary Go functions backed by PostgreSQL.
+// Package endure provides durable execution of ordinary Go functions.
 //
 // A workflow is a Go function whose side effects are wrapped in Step calls. Each step's result
 // is checkpointed; when a worker dies, another worker re-runs the function and completed steps
@@ -23,6 +23,9 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/appex-uk/go-endure/storage"
+	"github.com/appex-uk/go-endure/storage/postgres"
 )
 
 // Options configure an Engine. Zero values select defaults.
@@ -52,8 +55,18 @@ type registration struct {
 	run func(ctx Context, input []byte) ([]byte, error)
 }
 
-// New creates an Engine. Call Migrate once before use.
+// New creates an Engine backed by PostgreSQL. Call Migrate once before use.
+// Use NewWithStorage to select SQLite, filesystem or a custom storage adapter.
 func New(pool *pgxpool.Pool, opts Options) *Engine {
+	return NewWithStorage(postgres.New(pool), opts)
+}
+
+// NewWithStorage creates an Engine using storage. Call backend.Migrate once before use,
+// or set AutoMigrate when opening a built-in adapter with OpenStorage.
+func NewWithStorage(backend storage.Storage, opts Options) *Engine {
+	if backend == nil {
+		panic("endure: nil storage")
+	}
 	if opts.WorkerID == "" {
 		opts.WorkerID = uuid.NewString()
 	}
@@ -69,7 +82,12 @@ func New(pool *pgxpool.Pool, opts Options) *Engine {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
-	return &Engine{st: &store{pool: pool}, opts: opts, regs: map[string]registration{}, wake: make(chan struct{}, 1)}
+	return &Engine{
+		st:   &store{backend: backend},
+		opts: opts,
+		regs: map[string]registration{},
+		wake: make(chan struct{}, 1),
+	}
 }
 
 func (e *Engine) register(name string, r registration) {
@@ -135,8 +153,11 @@ func (e *Engine) Run(ctx context.Context) error {
 
 		if free > 0 {
 			claims, err := e.st.claim(ctx, e.opts.WorkerID, e.opts.LeaseDuration, names, free)
-			if err != nil && ctx.Err() == nil {
-				e.opts.Logger.Error("endure: claim failed", "error", err)
+			if err != nil {
+				if ctx.Err() == nil {
+					e.opts.Logger.Error("endure: claim failed", "error", err)
+				}
+				claims = nil
 			}
 			for _, c := range claims {
 				mu.Lock()

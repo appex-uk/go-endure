@@ -1,10 +1,10 @@
 # go-endure
 
-Durable execution for ordinary Go functions, backed by PostgreSQL.
+Durable execution for ordinary Go functions, with pluggable storage.
 
-Wrap the side effects in your function with `endure.Step`. Each result is checkpointed in Postgres. If the process dies, another replica picks the workflow up, runs your function again from the top, and completed steps return their stored results instead of executing a second time.
+Wrap the side effects in your function with `endure.Step`. Each result is checkpointed in PostgreSQL, SQLite or the filesystem. If the process dies, another worker picks the workflow up, runs your function again from the top, and completed steps return their stored results instead of executing a second time.
 
-There is no orchestration server, no YAML, no DSL and no extra broker. Postgres is the control plane; your pods are just workers.
+There is no orchestration server, DSL or extra broker. Choose an included storage adapter or implement the exported `storage.Storage` interface for another backend.
 
 ```go
 func Provision(ctx endure.Context, req Request) (Cluster, error) {
@@ -26,6 +26,7 @@ func Provision(ctx endure.Context, req Request) (Cluster, error) {
 - [Features](#features)
 - [Installation](#installation)
 - [Getting started](#getting-started)
+- [Storage adapters](#storage-adapters)
 - [Core concepts](#core-concepts)
 - [Guide](#guide)
 - [Configuration](#configuration)
@@ -46,6 +47,7 @@ func Provision(ctx endure.Context, req Request) (Cluster, error) {
 | Saga-style compensation | `Defer` |
 | Idempotent start by workflow ID | `Workflow.Start` |
 | Multi-replica failover via leases | `Engine.Run` |
+| Pluggable persistence | `storage.Storage`, `NewWithStorage` |
 
 ## Installation
 
@@ -53,13 +55,13 @@ func Provision(ctx endure.Context, req Request) (Cluster, error) {
 go get github.com/appex-uk/go-endure
 ```
 
-Requirements:
+Requirements and included backends:
 
-- PostgreSQL 13 or newer (uses `gen_random_uuid()` and `FOR UPDATE SKIP LOCKED`).
-- A `*pgxpool.Pool` from [pgx v5](https://github.com/jackc/pgx).
-- The Go version in [go.mod](go.mod).
+- Go version from [go.mod](go.mod).
+- PostgreSQL 13 or newer for the `storage/postgres` adapter (uses `gen_random_uuid()` and `FOR UPDATE SKIP LOCKED`).
+- No external service for the pure-Go SQLite or filesystem adapters.
 
-Nothing needs to be copied between repositories. The whole library is one Go package (`endure`) at the module root, and `schema.sql` is embedded in the binary, so `endure.Migrate` needs no extra files. Import it like any other dependency:
+Nothing needs to be copied between repositories. Schemas and migrations are embedded in their adapters. Import the root package and, when desired, the adapter packages directly:
 
 ```go
 import "github.com/appex-uk/go-endure"
@@ -76,14 +78,27 @@ During local development of go-endure itself, point a consumer at your checkout 
 
 ## Getting started
 
-### 1. Start a Postgres
+### 1. Choose storage
 
-```bash
-docker run -d --name endure-pg -p 5432:5432 \
-  -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=endure \
-  postgres:17
-export DATABASE_URL=postgres://postgres:postgres@localhost:5432/endure
+The typed storage configuration works with configuration libraries and ordinary Go code:
+
+```go
+backend, err := endure.OpenStorage(ctx, endure.StorageConfig{
+    Backend: endure.StorageSQLite,
+    SQLite: endure.SQLiteStorageConfig{
+        Path: "endure.db",
+    },
+    AutoMigrate: true,
+})
+if err != nil {
+    log.Fatal(err)
+}
+if closer, ok := backend.(io.Closer); ok {
+    defer closer.Close()
+}
 ```
+
+Use `StorageFile` for a local JSON state directory or `StoragePostgres` with a DSN. See [Storage adapters](#storage-adapters) for configuration and direct constructors.
 
 ### 2. Write a workflow
 
@@ -93,12 +108,11 @@ package main
 import (
     "context"
     "fmt"
+    "io"
     "log"
     "os"
     "os/signal"
     "time"
-
-    "github.com/jackc/pgx/v5/pgxpool"
 
     "github.com/appex-uk/go-endure"
 )
@@ -134,17 +148,19 @@ func main() {
     ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
     defer stop()
 
-    pool, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
+    backend, err := endure.OpenStorage(ctx, endure.StorageConfig{
+        Backend: endure.StorageSQLite,
+        SQLite: endure.SQLiteStorageConfig{Path: "endure.db"},
+        AutoMigrate: true,
+    })
     if err != nil {
         log.Fatal(err)
     }
-    defer pool.Close()
-
-    if err := endure.Migrate(ctx, pool); err != nil {
-        log.Fatal(err)
+    if closer, ok := backend.(io.Closer); ok {
+        defer closer.Close()
     }
 
-    engine := endure.New(pool, endure.Options{})
+    engine := endure.NewWithStorage(backend, endure.Options{})
     fulfil := endure.Register(engine, "fulfil-order", Fulfil)
 
     // Run the worker loop in the background; it stops when ctx is cancelled.
@@ -166,9 +182,99 @@ func main() {
 
 ### 3. Run more than one replica
 
-Run the same binary several times against the same database. Each replica registers the same workflows and calls `engine.Run`. Kill any of them mid-workflow; another replica takes over once the dead replica's lease expires.
+Run the same binary several times with a backend shared by the workers. Each replica registers the same workflows and calls `engine.Run`. Kill any of them mid-workflow; another replica takes over once the dead replica's lease expires. PostgreSQL is the recommended backend across independent hosts; SQLite and filesystem storage are best for a single host or a deliberately shared local volume.
 
 Processes that only start workflows or send signals (for example an API server) can create an `Engine` and call `Register`, `Start` and `Signal` without ever calling `Run`.
+
+## Storage adapters
+
+The engine depends only on the exported [`storage.Storage`](storage/storage.go) interface. This makes a store straightforward to implement, substitute in tests or move into a reusable application template.
+
+| Backend | Import | Configuration | Concurrency |
+|---------|--------|---------------|-------------|
+| PostgreSQL | `github.com/appex-uk/go-endure/storage/postgres` | DSN | Recommended for independent hosts and replicas |
+| SQLite | `github.com/appex-uk/go-endure/storage/sqlite` | File path | Atomic across local processes; one connection per adapter |
+| Filesystem | `github.com/appex-uk/go-endure/storage/file` | Managed directory path | OS-file-locked JSON state; intended for a local or reliably shared filesystem |
+| Custom | Your package | Adapter-specific | Implement the contract's locking and lease rules |
+
+`endure.OpenStorage` selects a built-in adapter from typed configuration:
+
+```go
+backend, err := endure.OpenStorage(ctx, endure.StorageConfig{
+    Backend: endure.StoragePostgres,
+    PostgreSQL: endure.PostgreSQLStorageConfig{
+        DSN: os.Getenv("DATABASE_URL"),
+    },
+    AutoMigrate: true,
+})
+```
+
+```go
+backend, err := endure.OpenStorage(ctx, endure.StorageConfig{
+    Backend: endure.StorageFile,
+    File: endure.FileStorageConfig{
+        Path: "./var/endure",
+    },
+    AutoMigrate: true,
+})
+```
+
+Canonical backend values are `postgres`, `sqlite` and `file`. `postgresql`, `sqlite3`, `filesystem` and `file-system` are accepted aliases. All `StorageConfig` fields have `json`, `yaml` and `koanf` tags.
+
+For explicit lifecycle control, construct an adapter directly:
+
+```go
+backend, err := sqlite.Open(ctx, storage.SQLiteConfig{Path: "endure.db"})
+if err != nil {
+    log.Fatal(err)
+}
+defer backend.Close()
+
+if err := backend.Migrate(ctx); err != nil {
+    log.Fatal(err)
+}
+engine := endure.NewWithStorage(backend, endure.Options{})
+```
+
+Adapters returned by `OpenStorage` may implement `io.Closer`; close them when they are no longer used. The PostgreSQL compatibility API remains available:
+
+```go
+pool, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
+if err != nil {
+    log.Fatal(err)
+}
+defer pool.Close()
+
+if err := endure.Migrate(ctx, pool); err != nil {
+    log.Fatal(err)
+}
+engine := endure.New(pool, endure.Options{})
+```
+
+### Custom adapters
+
+Import `github.com/appex-uk/go-endure/storage` and implement `storage.Storage`:
+
+```go
+var _ storage.Storage = (*MyStore)(nil)
+
+backend := NewMyStore(config)
+if err := backend.Migrate(ctx); err != nil {
+    log.Fatal(err)
+}
+engine := endure.NewWithStorage(backend, endure.Options{})
+```
+
+An adapter must:
+
+- atomically claim at most `ClaimRequest.Limit` due workflows;
+- issue and rotate unique lease tokens;
+- reject every stale fenced write with `storage.ErrLeaseLost`;
+- make signal insertion and wakeup race-free with `WaitForSignal`;
+- preserve the first signal for each `(workflow, name)`;
+- implement `Migrate` idempotently and safely under concurrent startup.
+
+The engine does not inspect a backend's implementation. This allows the workflow API and execution guarantees to remain stable while an application owns driver, connection-pool and deployment-specific choices.
 
 ## Core concepts
 
@@ -188,7 +294,7 @@ Workflow states: `queued` → `running` → (`queued` again after a sleep or ret
 ### Workflows
 
 ```go
-engine := endure.New(pool, endure.Options{})
+engine := endure.NewWithStorage(backend, endure.Options{})
 wf := endure.Register(engine, "provision", Provision) // before engine.Run
 ```
 
@@ -242,7 +348,7 @@ The wake time is persisted the first time `Sleep` is reached. The workflow is re
 // In the workflow
 approval, err := endure.Wait[Approval](ctx, "manager-approval")
 
-// From anywhere that has an Engine on the same database
+// From anywhere that has an Engine on the same storage
 err := engine.Signal(ctx, workflowID, "manager-approval", Approval{By: "alice"})
 ```
 
@@ -301,6 +407,8 @@ if err := endure.Defer(ctx, "delete-cluster", func(ctx context.Context) error {
 | `ErrNameMismatch` | `Start` with an ID already used by another workflow name. |
 | `ErrDuplicateStep` | A step, sleep, wait or defer name used twice in one workflow. |
 | `ErrLeaseLost` | Another worker took the workflow; the local execution is abandoned (internal, logged). |
+| `ErrInvalidStorageConfig` | A configured storage backend is missing required values. |
+| `ErrUnsupportedStorageBackend` | `OpenStorage` does not know the configured backend. |
 
 **Return errors from `Step`, `Sleep` and `Wait` unchanged**, or wrapped with `%w`. Retries, sleeps and signal waits suspend the workflow by returning a special internal error that unwinds your function. Swallowing or replacing it breaks suspension.
 
@@ -320,7 +428,7 @@ The workflow function is re-run from the top on every execution, so:
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `WorkerID` | random UUID | Identifies the worker in `endure_workflow.worker_id`. |
+| `WorkerID` | random UUID | Identifies the worker in persisted lease metadata. |
 | `LeaseDuration` | `30s` | How long a claim lasts without renewal. The heartbeat renews every third of this. Also the worst-case failover delay after a hard crash. |
 | `PollInterval` | `500ms` | How often idle workers look for work. Also the polling interval of `Handle.Wait`. |
 | `MaxConcurrent` | `16` | Maximum workflows executed concurrently by this engine. |
@@ -328,20 +436,21 @@ The workflow function is re-run from the top on every execution, so:
 
 Tuning notes:
 
-- Shorter leases fail over faster but need a healthier database connection; the heartbeat must complete well inside the lease.
-- Size the `pgxpool` for roughly `MaxConcurrent` plus a few connections for heartbeats and claims.
+- Shorter leases fail over faster but need a healthier storage connection; the heartbeat must complete well inside the lease.
+- For PostgreSQL, size the `pgxpool` for roughly `MaxConcurrent` plus a few connections for heartbeats and claims.
+- SQLite adapters intentionally use one connection and coordinate write transactions with `BEGIN IMMEDIATE`.
+- Filesystem storage rewrites one locked JSON state file and is intended for small, local workloads rather than high-throughput queues.
 
 ## How it works
 
 ```
                  +-----------------------------+
- Start / Signal  |         PostgreSQL          |
-  ------------>  |  endure_workflow            |
-                 |  endure_step                |
-                 |  endure_signal              |
+ Start / Signal  |      storage.Storage        |
+  ------------>  |  workflow / step / signal   |
+                 |       persistent state      |
                  +--------------+--------------+
                                 ^
-              claim (SKIP LOCKED), heartbeat, checkpoint
+                claim, heartbeat, checkpoint
                                 |
       +-------------------------+-------------------------+
       |                         |                         |
@@ -349,19 +458,19 @@ Tuning notes:
   engine.Run                engine.Run                engine.Run
 ```
 
-**Claiming.** Workers run `UPDATE ... WHERE id IN (SELECT ... FOR UPDATE SKIP LOCKED LIMIT n)` over workflows that are `queued` and due, or `running` with an expired lease. Replicas never receive the same workflow. Workers only claim workflow names they have registered, so rolling deployments with different workflow sets are safe.
+**Claiming.** The adapter atomically claims `queued` workflows that are due, or `running` workflows with an expired lease. PostgreSQL uses row locking and `SKIP LOCKED`; SQLite uses `BEGIN IMMEDIATE`; filesystem storage uses an OS file lock. Workers only claim workflow names they have registered, so rolling deployments with different workflow sets are safe.
 
-**Leases and fencing.** A claim stamps a fresh lease token. A heartbeat extends the lease. Every write — checkpoint, completion, suspension — runs in a transaction that locks the workflow row and checks the token, so a worker that lost its lease (paused, partitioned, evicted) can no longer change anything, and its local execution is cancelled.
+**Leases and fencing.** A claim stamps a fresh lease token. A heartbeat extends the lease. Every adapter must atomically fence writes to checkpoints, completion and suspension by the token, so a worker that lost its lease cannot change anything and its local execution is cancelled.
 
 **Checkpointing.** Before a step runs, an attempt row is written. After it returns, the result is committed. On the next execution, `Step` finds the completed row and returns the stored value.
 
-**Suspension.** Sleeps, retry backoffs and signal waits release the workflow: sleeps and retries go back to `queued` with a future `run_at`; signal waits go to `waiting`. A row lock orders `Signal` against suspension so a signal is never lost between check and park.
+**Suspension.** Sleeps, retry backoffs and signal waits release the workflow: sleeps and retries go back to `queued` with a future `run_at`; signal waits go to `waiting`. Signal insertion and suspension are ordered inside the adapter so a wakeup cannot be lost.
 
 **Shutdown.** When the context passed to `Run` is cancelled, in-flight executions are cancelled and their workflows are released immediately for other workers, without waiting for lease expiry.
 
-### Schema
+### Logical schema
 
-`Migrate` applies [schema.sql](schema.sql), which is idempotent and safe to run concurrently from several replicas:
+All adapters persist the same logical model. PostgreSQL's embedded [schema](storage/postgres/schema.sql) maps it to relational tables:
 
 | Table | Purpose |
 |-------|---------|
@@ -372,19 +481,20 @@ Tuning notes:
 ## Guarantees and limitations
 
 - **Steps are at-least-once.** If a process dies after a side effect but before its checkpoint commits, the step runs again. No library can make an external call atomic with a database commit. Use `StepInfo.IdempotencyKey()` with APIs that support idempotency keys; for those that don't, make the step reconcile (check, then act).
+- **Adapter correctness is part of durability.** Custom adapters must provide the atomic claim and lease-fencing semantics documented on `storage.Storage`.
 - **Checkpointed steps are never re-executed.** Once a step's result is committed, later executions return it from storage. This is what the chaos tests assert.
-- **Workflows eventually finish** as long as at least one worker is running and the database is available.
+- **Workflows eventually finish** as long as at least one worker is running and storage is available.
 - **Failover time after a hard crash is up to `LeaseDuration`.** Graceful shutdown releases work immediately.
 - **Results are JSON.** Changing a step's result type incompatibly while workflows are in flight breaks decoding of stored results.
 - **Step names are part of your persistent state.** Renaming or reordering steps while workflows are in flight changes what existing executions do.
-- **A step that always crashes the process is retried forever.** Crashes do not count as failures. Monitor `endure_workflow.attempt`.
+- **A step that always crashes the process is retried forever.** Crashes do not count as failures. Monitor the persisted workflow attempt.
 - **No built-in retention.** Completed workflows stay in the tables until you delete them (see below).
-- **Timers use the worker's clock** when computing wake times and the database clock when claiming. Keep clocks reasonably in sync.
+- **Timers use wall-clock time.** SQLite and filesystem adapters use the worker clock; PostgreSQL claiming uses the database clock. Keep worker and database clocks reasonably in sync.
 - **Signals keep the first payload only** per name.
 
 ## Operations
 
-Useful queries:
+The PostgreSQL schema supports operational queries such as:
 
 ```sql
 -- Workflows by state
@@ -412,20 +522,28 @@ WHERE status IN ('completed', 'failed') AND updated_at < now() - interval '30 da
 
 Failed workflows are not retried automatically. To rerun one, delete it and `Start` it again with the same ID, or start a new ID.
 
+SQLite stores the logical records in an ordinary local database, while filesystem storage keeps them in `endure.json`; use the same retention and inspection practices appropriate to that backend.
+
 ## Testing
 
-Tests need a real PostgreSQL. Set `DATABASE_URL`; without it the tests skip.
+Filesystem and SQLite contract, recovery, concurrency and fencing tests run locally without an external service. PostgreSQL integration and chaos tests run when `DATABASE_URL` is set and otherwise skip.
+
+```bash
+go vet ./...
+go test -race -count=1 ./...
+```
+
+To include the PostgreSQL integration and chaos suites:
 
 ```bash
 docker run -d --name endure-test -p 5433:5432 \
   -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=endure_test postgres:17
 
 export DATABASE_URL=postgres://postgres:postgres@localhost:5433/endure_test
-go vet ./...
 go test -race -count=1 ./...
 ```
 
-The suite covers the happy path, idempotent start, retries, permanent failures, compensation order, sleeps, signals before and after parking, and duplicate step names.
+The suite covers the happy path, idempotent start, retries, permanent failures, compensation order, sleeps, signals before and after parking, duplicate step names, cross-instance claims, lease fencing and crash recovery.
 
 ### Chaos tests
 
@@ -434,7 +552,7 @@ The suite covers the happy path, idempotent start, retries, permanent failures, 
 - **Single crash at every point.** For a workflow `A -> B -> C -> D`, an in-process fault hook simulates abrupt process death before, after the side effect, and after the checkpoint of each step. The execution is dropped with no cleanup. The test asserts the workflow still completes and that only a crash between side effect and checkpoint re-runs a step.
 - **Two workers under random crashes.** Thirty workflows run on two workers with random crashes while one worker is repeatedly stopped and restarted. The test asserts that every workflow finishes and that no already-checkpointed step is executed again.
 
-When testing your own workflows, run them against a real Postgres with short `LeaseDuration` and `PollInterval` values, e.g. `endure.Options{LeaseDuration: 300 * time.Millisecond, PollInterval: 10 * time.Millisecond}`, and give each test unique workflow names or IDs.
+When testing your own workflows, run them against the same adapter used in production with short `LeaseDuration` and `PollInterval` values, e.g. `endure.Options{LeaseDuration: 300 * time.Millisecond, PollInterval: 10 * time.Millisecond}`, and give each test unique workflow names or IDs.
 
 ## Non-goals
 
@@ -443,8 +561,8 @@ go-endure deliberately stays small. It does not provide, and does not plan to pr
 - Deterministic event-history replay (it uses checkpointed steps instead)
 - A separate server, Kubernetes operator or CRDs
 - A workflow definition language or visual designer
-- A message broker, leader election or custom storage engine
+- A message broker or separate leader-election service
 - Multi-language SDKs
 - Exactly-once guarantees for external side effects
 
-Postgres already provides persistence, transactions, locking, indexing, replication and backup. go-endure uses them directly rather than abstracting over them.
+PostgreSQL remains the default production recommendation for multiple hosts because it provides mature transactions, locking, indexing, replication and backup. Smaller applications can use SQLite or filesystem storage through the same API.

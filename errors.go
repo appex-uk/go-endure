@@ -4,17 +4,23 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/appex-uk/go-endure/storage"
 )
 
 var (
 	// ErrLeaseLost means another worker took over the workflow; the local execution is abandoned.
-	ErrLeaseLost = errors.New("endure: lease lost")
+	ErrLeaseLost = storage.ErrLeaseLost
 	// ErrNotFound means the workflow does not exist.
-	ErrNotFound = errors.New("endure: workflow not found")
+	ErrNotFound = storage.ErrNotFound
 	// ErrNameMismatch means a workflow ID already exists under a different workflow name.
-	ErrNameMismatch = errors.New("endure: workflow id already used by a different workflow")
+	ErrNameMismatch = storage.ErrNameMismatch
 	// ErrDuplicateStep means a step, sleep or wait name was used twice in one workflow.
 	ErrDuplicateStep = errors.New("endure: duplicate step name")
+	// ErrInvalidStorageConfig means a storage adapter is missing required configuration.
+	ErrInvalidStorageConfig = storage.ErrInvalidConfig
+	// ErrUnsupportedStorageBackend means no built-in adapter exists for a configured backend.
+	ErrUnsupportedStorageBackend = storage.ErrUnsupportedBackend
 
 	// errCrash simulates abrupt process death in tests: the execution is dropped without any writes.
 	errCrash = errors.New("endure: simulated crash")
